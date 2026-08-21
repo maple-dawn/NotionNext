@@ -8,7 +8,7 @@ import {
 } from '@/lib/hn-publisher/extract'
 import { parseActiveStories } from '@/lib/hn-publisher/hn'
 import { assertPublicUrl, isPrivateAddress } from '@/lib/hn-publisher/http'
-import { requestGeminiJson } from '@/lib/hn-publisher/gemini'
+import { requestGeminiJson, translateArticle } from '@/lib/hn-publisher/gemini'
 import {
   buildNotionPagePayload,
   discoverNotionDataSource,
@@ -115,7 +115,7 @@ describe('Hacker News publisher', () => {
     )
     const article = await extractStory(story, {
       maxCharacters: 50000,
-      maxBlocks: 97,
+      maxBlocks: 100,
       fetchOptions: {
         fetchImpl,
         resolveHost: () =>
@@ -186,6 +186,89 @@ describe('Hacker News publisher', () => {
     ).rejects.toMatchObject({ code: 'gemini_invalid_json' })
   })
 
+  test('uses the full bounded article text to generate an AI summary title', async () => {
+    const marker = 'CONTENT_AFTER_THE_OLD_EXCERPT_LIMIT'
+    const article = {
+      sourceTitle: 'Original title',
+      blocks: [
+        {
+          id: 'code-1',
+          type: 'code',
+          text: `${'a'.repeat(13000)}${marker}`
+        }
+      ]
+    }
+    const fetchImpl = jest.fn((_url, options) => {
+      const request = JSON.parse(options.body)
+      expect(request.contents[0].parts[0].text).toContain(marker)
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      title: 'GitHub扩容失误引发近八小时故障',
+                      summary: '中文摘要。'
+                    })
+                  }
+                ]
+              }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    })
+
+    await expect(
+      translateArticle(article, story, {
+        apiKey: 'key',
+        model: 'model',
+        fetchImpl,
+        attempts: 1
+      })
+    ).resolves.toMatchObject({
+      title: 'GitHub扩容失误引发近八小时故障',
+      summary: '中文摘要。'
+    })
+  })
+
+  test.each([
+    { title: '', caseName: 'empty' },
+    { title: '第一行\n第二行', caseName: 'multiline' },
+    { title: '标'.repeat(61), caseName: 'long' }
+  ])('rejects a $caseName Gemini title', async ({ title }) => {
+    const fetchImpl = jest.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  { text: JSON.stringify({ title, summary: '中文摘要。' }) }
+                ]
+              }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    )
+
+    await expect(
+      translateArticle(
+        {
+          sourceTitle: 'Original title',
+          blocks: [{ id: 'code-1', type: 'code', text: 'const value = 1' }]
+        },
+        story,
+        { apiKey: 'key', model: 'model', fetchImpl, attempts: 1 }
+      )
+    ).rejects.toMatchObject({ code: 'gemini_invalid_metadata' })
+  })
+
   test('validates and discovers exactly one Notion data source', async () => {
     expect(validateNotionSchema(notionSchema())).toEqual(notionSchema())
     const request = jest
@@ -213,7 +296,7 @@ describe('Hacker News publisher', () => {
     })
   })
 
-  test('builds a published NotionNext page with attribution and no images', () => {
+  test('builds a published NotionNext page with translated content only', () => {
     const payload = buildNotionPagePayload({
       dataSourceId: 'source-1',
       schema: notionSchema(),
@@ -223,7 +306,7 @@ describe('Hacker News publisher', () => {
         sourceUrl: story.url
       },
       translation: {
-        title: '中文标题',
+        title: 'AI总结标题',
         summary: '中文摘要。',
         blocks: [
           {
@@ -242,8 +325,38 @@ describe('Hacker News publisher', () => {
     expect(payload.properties.status).toEqual({ select: { name: 'Published' } })
     expect(payload.properties.slug.rich_text[0].text.content).toBe('hn-123')
     expect(payload.properties.date.date.start).toBe('2026-08-21')
-    expect(payload.children).toHaveLength(3)
-    expect(JSON.stringify(payload.children)).not.toContain('image')
+    expect(payload.properties.title.title[0].text.content).toBe('AI总结标题')
+    expect(payload.children).toHaveLength(1)
+    const children = JSON.stringify(payload.children)
+    expect(children).toContain('中文正文。')
+    expect(children).not.toContain('本文由晨枫博客自动翻译')
+    expect(children).not.toContain('机器翻译仅供参考')
+    expect(children).not.toContain(story.url)
+    expect(children).not.toContain(story.discussionUrl)
+    expect(children).not.toContain('image')
+  })
+
+  test('allows exactly 100 Notion content blocks and rejects 101', () => {
+    const buildPayload = count =>
+      buildNotionPagePayload({
+        dataSourceId: 'source-1',
+        schema: notionSchema(),
+        story,
+        translation: {
+          title: 'AI总结标题',
+          summary: '中文摘要。',
+          blocks: Array.from({ length: count }, (_, index) => ({
+            id: `block-${index}`,
+            type: 'paragraph',
+            segments: [{ text: `正文${index}` }]
+          }))
+        }
+      })
+
+    expect(buildPayload(100).children).toHaveLength(100)
+    expect(() => buildPayload(101)).toThrow(
+      'Article exceeds the Notion create-page block limit'
+    )
   })
 
   test('falls back after a source error and dry-run never writes to Notion', async () => {
@@ -270,7 +383,7 @@ describe('Hacker News publisher', () => {
         geminiModel: 'model',
         maxCandidates: 10,
         maxSourceCharacters: 50000,
-        maxNotionBlocks: 97,
+        maxNotionBlocks: 100,
         siteUrl: 'https://www.imaple.tech'
       },
       dependencies: {
