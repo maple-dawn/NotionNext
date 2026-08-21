@@ -1,5 +1,16 @@
 {
   "cleanUrls": true,
   "trailingSlash": false,
-  "headers": []
+  "headers": [],
+  "crons": [
+    {
+      "path": "/api/cron/hn-publish",
+      "schedule": "0 0 * * *"
+    }
+  ],
+  "functions": {
+    "pages/api/cron/hn-publish.js": {
+      "maxDuration": 60
+    }
+  }
 }
